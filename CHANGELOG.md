@@ -7,47 +7,93 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Added
-- `classify_redis` rule: type-based classification of `redis.exceptions.*` (no message
-  parsing). Registered in `DEFAULT_RULES` before `classify_builtin`, since
-  `redis.exceptions.LockError` subclasses `ValueError` and would otherwise be
-  intercepted there. Handles the `AuthenticationError`/`AuthorizationError`
-  (`ConnectionError` subclasses) and `ClusterDownError`/`TryAgainError`
-  (`ResponseError` subclasses) edge cases explicitly so credential failures and
-  transient cluster-resharding states aren't misclassified.
-- New `redis` optional dependency group (`redis>=4.2.0,<6.0`).
-- `classify_aws` rule: `Error.Code`-based classification of `botocore.exceptions.ClientError`
-  (mirroring botocore's own internal retry policy from `botocore.retries.standard`, not an
-  invented list), plus type-based dispatch for connection-level `BotoCoreError`s. Deliberately
-  does not reuse `classify_http_status`, because AWS returns HTTP `400` for both throttling and
-  genuine permanent validation errors — status-code-only classification would misclassify
-  throttling as non-retryable. Registered in `DEFAULT_RULES` before `classify_builtin`, since
-  `botocore.exceptions.ConnectTimeoutError`/`ReadTimeoutError`/`ProxyConnectionError` subclass
-  builtin `OSError` and would otherwise be intercepted there.
-- New `aws` optional dependency group (`botocore>=1.34.0,<2.0`).
-- `classify_gcp` rule: type-based classification of `google.api_core.exceptions.*`.
-  Registered in `DEFAULT_RULES` *before* `classify_http_status` — google-api-core
-  exceptions expose a `.code` attribute that the generic HTTP-status extraction
-  already reads, so `classify_http_status` would otherwise intercept every GCP
-  exception first. Fixes two cases where GCP's own semantics diverge from generic
-  HTTP status-code conventions: `Aborted` (HTTP 409, but retryable — transaction
-  conflict, same precedent as Postgres `40001`/Redis `WatchError`) and
-  `DeadlineExceeded`/`GatewayTimeout`/`BadGateway` (HTTP 504/502, but not
-  retryable by google-api-core's own default retry policy). Every other case is
-  classified explicitly with its own `gcp_*` reason code rather than delegating to
-  the generic HTTP rule, to avoid GCP's correctness silently depending on
-  `classify_http_status`'s status-code tables never changing.
-- New `gcp` optional dependency group (`google-api-core>=2.0.0,<3.0`).
-- `classify_azure` rule: type/status-based classification of `azure.core.exceptions.*`.
-  Registered in `DEFAULT_RULES` *before* `classify_http_status` — `HttpResponseError`
-  exposes a `.status_code` attribute (the first name the generic HTTP-status
-  extraction checks), so `classify_http_status` would otherwise intercept every
-  Azure exception first. `ResourceModifiedError` (ETag conflict, typically HTTP
-  412) is treated as retryable — same precedent as Postgres `40001`, Redis
-  `WatchError`, AWS `ConditionalCheckFailedException`, and GCP `Aborted` — and is
-  disambiguated by type from `ResourceNotFoundError`, which can carry the same
-  412 status on update operations but stays non-retryable.
-- New `azure` optional dependency group (`azure-core>=1.28.0,<2.0`).
+---
+
+## [1.1.0] — 2026-07-20
+
+Four new provider integrations (Redis, AWS, GCP, Azure), a telemetry hook, and two
+reliability fixes to the classifier core itself. No breaking changes — every
+addition is opt-in (new optional dependency groups, a new keyword-only parameter
+defaulting to `None`) and all existing rule behavior is unchanged.
+
+### Added — provider classification rules
+
+Each new rule is self-contained (own file under `retryguard/rules/`, own `reason_code`
+namespace) and independently verified against the real installed package, not
+written from memory. Install via the matching extra, e.g. `pip install "retryguard[redis]"`.
+
+- **Redis** (`classify_redis`, extra: `redis`, `redis>=4.2.0,<6.0`) — type-based
+  classification of `redis.exceptions.*`. Registered before `classify_builtin`
+  because `redis.exceptions.LockError` subclasses `ValueError` and would
+  otherwise be intercepted there. `AuthenticationError`/`AuthorizationError`
+  (which subclass `ConnectionError`) and `ClusterDownError`/`TryAgainError`
+  (which subclass `ResponseError`) are handled explicitly so credential failures
+  and transient cluster-resharding states aren't misclassified by their parent
+  class's default.
+- **AWS** (`classify_aws`, extra: `aws`, `botocore>=1.34.0,<2.0`) — `Error.Code`-based
+  classification of `botocore.exceptions.ClientError`, sourced from botocore's own
+  internal retry policy (`botocore.retries.standard`) rather than an invented
+  list, plus type-based dispatch for connection-level `BotoCoreError`s.
+  Deliberately does not reuse `classify_http_status`: AWS returns HTTP `400` for
+  both throttling and genuine permanent validation errors, so status-code-only
+  classification would misclassify throttling as non-retryable.
+- **GCP** (`classify_gcp`, extra: `gcp`, `google-api-core>=2.0.0,<3.0`) — type-based
+  classification of `google.api_core.exceptions.*`. Registered *before*
+  `classify_http_status`, since these exceptions expose a `.code` attribute the
+  generic HTTP-status extraction already reads. Overrides two cases where GCP's
+  semantics diverge from generic HTTP conventions: `Aborted` (HTTP 409, but
+  retryable — transaction conflict) and `DeadlineExceeded`/`GatewayTimeout`/
+  `BadGateway` (HTTP 504/502, but not retryable per google-api-core's own
+  default retry policy).
+- **Azure** (`classify_azure`, extra: `azure`, `azure-core>=1.28.0,<2.0`) —
+  type/status-based classification of `azure.core.exceptions.*`. Also registered
+  before `classify_http_status` (`HttpResponseError.status_code` is the first
+  attribute name the generic extraction checks). `ResourceModifiedError` (ETag
+  conflict, typically HTTP 412) is retryable and disambiguated by type from
+  `ResourceNotFoundError`, which can carry the same 412 status on update
+  operations but stays non-retryable.
+
+All four providers share one precedent for optimistic-concurrency conflicts —
+Postgres `40001`, Redis `WatchError`, AWS `ConditionalCheckFailedException`, GCP
+`Aborted`, and Azure `ResourceModifiedError` are all treated as retryable: not
+because the underlying transport auto-retries them (none do), but because the
+correct response is "the caller redoes the operation with fresh data," which is
+what `retryable=True` means at retryguard's level.
+
+### Added — telemetry hook
+
+- `ErrorClassifier` accepts an optional keyword-only `on_decision` callback,
+  invoked with `(exc, decision)` every time `classify()` produces a
+  `RetryDecision`. Fires for every call path (direct usage, `classify_error()`/
+  `should_retry()`, the tenacity/Celery integrations) since they all funnel
+  through `classify()`. If the hook raises, the exception is logged (not
+  propagated) and the returned decision is unaffected — the decision is
+  computed and finalized *before* the hook runs, so it can never alter the
+  outcome. Defaults to `None`; no behavior change for existing callers.
+
+### Fixed
+
+- `ErrorClassifier.classify()`'s rule loop previously swallowed a crashing rule
+  silently (`except Exception: continue`, no logging) — a bug in a `classify_*`
+  rule (built-in or custom) could produce a silently-wrong fallback decision
+  with no trace of why. Now logged via `logging.getLogger("retryguard.classifier")`
+  at `ERROR` level with the full traceback before continuing to the next rule;
+  control flow (skip-and-continue, same `UNKNOWN` fallback) is unchanged.
+- GitHub Actions CI was only installing the `http`/`db`/`retry`/`dev` extras, so
+  every Redis/AWS/GCP/Azure test was silently skipped in CI and coverage on
+  those rule files was never actually measured. CI now installs all provider
+  extras (`redis,aws,gcp,azure`) so the full suite and real coverage run on
+  every push.
+
+### Internal
+
+- `rules.py` (657 lines, 10 classification functions in one file) split into a
+  `rules/` package, one file per provider/concern (`_http.py`, `_builtin.py`,
+  `_db.py`, `_redis.py`, `_aws.py`, `_gcp.py`, `_azure.py`). Pure reorganization
+  — `rules/__init__.py` re-exports every name, so nothing importing from
+  `retryguard.rules` needs to change. Tests split to match
+  (`test_rules_http.py`, `test_rules_builtin.py`, etc.), keeping every source
+  and test file under 500 lines.
 
 ---
 

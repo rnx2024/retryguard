@@ -321,6 +321,38 @@ def classify_my_service(exc: BaseException) -> RetryDecision | None:
 classifier = ErrorClassifier(rules=(classify_my_service, *ErrorClassifier.DEFAULT_RULES))
 ```
 
+## Telemetry hook
+
+`ErrorClassifier` accepts an optional `on_decision` callback, invoked with `(exc, decision)`
+every time `classify()` produces a `RetryDecision` — wire it to whatever metrics/observability
+you already use (a counter, StatsD, OpenTelemetry, structlog) without retryguard taking on any
+new dependency:
+
+```python
+from collections import Counter
+from retryguard import ErrorClassifier
+
+counts: Counter[str] = Counter()
+
+classifier = ErrorClassifier(
+    on_decision=lambda exc, decision: counts.update([decision.reason_code]),
+)
+
+classifier.classify(TimeoutError("t"))
+print(counts)  # Counter({'builtin_timeout': 1})
+```
+
+If the hook itself raises, the exception is logged (via `logging.getLogger("retryguard.classifier")`,
+at `ERROR` level with the full traceback) and swallowed — it can never affect the returned
+`RetryDecision` or propagate to the caller of `classify()`. Because every call path in the
+library (direct usage, `classify_error()`/`should_retry()`, the tenacity integration, the Celery
+pattern above) funnels through `classify()`, a hook set on a classifier you pass to those helpers
+fires for all of them automatically.
+
+The hook runs **synchronously, inline with `classify()`** — keep it fast and non-blocking
+(increment a counter, enqueue to a queue) rather than doing synchronous I/O, or it undermines
+`classify()`'s own "no I/O, safe from any thread/coroutine" guarantee described above.
+
 ## Stable API (1.0+)
 
 The stable surface is the public package API:
