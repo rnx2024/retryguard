@@ -24,7 +24,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[http,db,retry,dev]"
+        run: pip install -e ".[http,db,redis,aws,gcp,azure,retry,dev]"
 
       - name: Run tests with coverage
         run: |
