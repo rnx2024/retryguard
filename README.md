@@ -32,6 +32,13 @@ It classifies:
   extraction from the wrapped DBAPI exception chain.
 - **Redis / redis-py** (when installed): type-based dispatch over `redis.exceptions.*` — no message
   parsing, since redis-py already parses the wire-protocol error into distinct exception classes.
+- **AWS SDK / botocore** (when installed): `Error.Code`-based classification for `ClientError`
+  (mirroring botocore's own internal retry policy), plus type-based dispatch for connection-level
+  `BotoCoreError`s.
+- **Google Cloud / google-api-core** (when installed): type-based dispatch over
+  `google.api_core.exceptions.*`, mirroring google-api-core's own default retry policy.
+- **Azure SDK / azure-core** (when installed): type/status-based classification of
+  `azure.core.exceptions.*`, mirroring azure-core's own default retry policy.
 - **Builtins**: `TimeoutError` (retryable), `ConnectionError`/`OSError` (retryable), `ValueError`
   (non-retryable).
 
@@ -116,6 +123,109 @@ Non-retryable examples:
   (`SCRIPT LOAD` / `EVAL`)
 - `LockError` / `LockNotOwnedError`, `DataError`, `InvalidResponse`, and any other `ResponseError`
   (syntax/argument errors, e.g. `WRONGTYPE`)
+
+## AWS SDK / botocore
+
+**AWS routinely returns HTTP `400` for throttling, not `429`** — many services (DynamoDB, Kinesis,
+STS, and others) return `ProvisionedThroughputExceededException`/`ThrottlingException` as HTTP `400`,
+the same status used for genuine permanent validation errors. Because of this, `retryguard` does
+**not** classify AWS errors via the generic `classify_http_status` rule — that would misclassify
+throttling as a permanent failure. Instead, `botocore.exceptions.ClientError` is classified primarily
+by its `Error.Code` string (a stable, documented field — exact-equality reads, not message parsing,
+the same category of thing as reading `sqlstate`), falling back to `HTTPStatusCode` only for codes
+without a specific mapping.
+
+AWS's service-specific "modeled" exceptions (e.g.
+`DynamoDB.Client.exceptions.ProvisionedThroughputExceededException`) are generated dynamically per
+boto3 client instance — not stable, importable classes — so this classification can't be type-based
+the way the Redis rule is. The retryable/throttling `Error.Code` lists are pulled directly from
+botocore's own internal retry policy (`botocore.retries.standard`), not invented.
+
+Retryable examples:
+
+- Connection-level `BotoCoreError`s: `ConnectTimeoutError`, `ReadTimeoutError`,
+  `EndpointConnectionError`, `ProxyConnectionError`, `ConnectionClosedError`, `HTTPClientError`
+- `Error.Code` in botocore's own throttling list: `ThrottlingException`, `Throttling`,
+  `RequestLimitExceeded`, `ProvisionedThroughputExceededException`, `TooManyRequestsException`,
+  `SlowDown`, and others — **including when returned as HTTP `400`**
+- `Error.Code` in botocore's own transient list: `RequestTimeout`, `RequestTimeoutException`,
+  `PriorRequestNotComplete`
+- `ConditionalCheckFailedException` (DynamoDB optimistic-lock conflict) — not in botocore's own retry
+  lists (identical request retry can't fix it), but treated as retryable at the caller-redo-the-operation
+  level, same precedent as Postgres `40001` and Redis `WatchError`
+- Unrecognized `Error.Code` with `HTTPStatusCode` `500/502/503/504` or `429`
+
+Non-retryable examples:
+
+- `NoCredentialsError`, `PartialCredentialsError`, `UnauthorizedSSOTokenError` — retrying doesn't fix
+  missing/bad credentials
+- Unrecognized `Error.Code` with `HTTPStatusCode` `401`/`403`
+- Any other unrecognized `Error.Code` (e.g. `ValidationException`, `ResourceNotFoundException`) —
+  defaults to non-retryable `CLIENT`, regardless of HTTP status
+
+## Google Cloud / google-api-core
+
+`google.api_core.exceptions.*` happens to expose a `.code` attribute that `retryguard`'s generic
+HTTP-status extraction already reads — meaning most GCP exceptions would already be classified
+"correctly" by `classify_http_status` alone. `retryguard` still classifies them explicitly via a
+dedicated, type-based rule (registered *before* `classify_http_status` in the pipeline, not after)
+so that GCP errors get GCP-specific reason codes independent of the generic HTTP status-code
+tables, and so the two cases below — where GCP's own semantics genuinely diverge from generic HTTP
+status-code conventions — are handled correctly:
+
+- `Aborted` shares HTTP status `409` with ordinary conflict errors, which are non-retryable by
+  generic convention. But `ABORTED` in Google Cloud (most commonly Firestore/Spanner/BigTable
+  transaction contention) means the caller should retry the operation — same precedent as Postgres
+  `40001` and Redis `WatchError`.
+- `DeadlineExceeded`/`GatewayTimeout`/`BadGateway` share HTTP statuses `504`/`502`, which are
+  retryable by generic convention. But google-api-core's own default retry policy
+  (`google.api_core.retry.retry_base.if_transient_error`) deliberately excludes these — a
+  timed-out RPC may have partially succeeded server-side, so blind retry isn't safe.
+
+Retryable examples:
+
+- `ResourceExhausted`/`TooManyRequests` (quota/rate-limit errors)
+- `ServiceUnavailable`, `InternalServerError` — matches google-api-core's own default retry policy
+- `Aborted` — transaction conflict; retry the operation (see above)
+
+Non-retryable examples:
+
+- `DeadlineExceeded`, `GatewayTimeout`, `BadGateway` — deliberately excluded from
+  google-api-core's own retry policy (see above)
+- `InvalidArgument`, `FailedPrecondition`, `OutOfRange` (400) — genuine validation errors; unlike
+  AWS's HTTP `400`, GCP doesn't overload this status with throttling
+- `Unauthorized`/`Unauthenticated`/`Forbidden`/`PermissionDenied` (401/403)
+- Anything else (e.g. `NotFound`, `AlreadyExists`) — defaults to non-retryable `CLIENT`
+
+## Azure SDK / azure-core
+
+Like GCP, `azure.core.exceptions.HttpResponseError` exposes a `.status_code` attribute that
+`retryguard`'s generic HTTP-status extraction already reads (`"status_code"` is in fact the
+*first* attribute name it checks) — so `classify_azure` is registered *before*
+`classify_http_status` in the pipeline, and classifies every case explicitly with its own
+`azure_*` reason code rather than relying on the generic rule.
+
+The one case that needs disambiguating by type, not status code: `ResourceModifiedError`
+(ETag conflict on a conditional write — Storage, Cosmos DB, App Configuration) typically
+carries HTTP `412`, same as `ResourceNotFoundError` can when raised on an update. `retryguard`
+treats `ResourceModifiedError` as retryable (re-read and retry the operation) — same precedent
+as Postgres `40001`, Redis `WatchError`, AWS `ConditionalCheckFailedException`, and GCP
+`Aborted` — while a `ResourceNotFoundError` carrying the same status code stays non-retryable.
+
+Retryable examples:
+
+- `ServiceRequestError`/`ServiceResponseError` and their timeout variants (connection-level,
+  no response received)
+- `ResourceModifiedError` — ETag conflict; retry the operation (see above)
+- HTTP `408`, `429`, `500`, `502`, `503`, `504` — matches azure-core's own default retry policy
+
+Non-retryable examples:
+
+- `ClientAuthenticationError`, or HTTP `401`/`403`
+- `ResourceNotModifiedError` (HTTP `304`) — not an error; retrying achieves nothing
+- `TooManyRedirectsError`, `DecodeError` — client-side/protocol issues
+- Anything else (e.g. `ResourceNotFoundError`, `ResourceExistsError`) — defaults to
+  non-retryable `CLIENT`
 
 ## Usage
 
