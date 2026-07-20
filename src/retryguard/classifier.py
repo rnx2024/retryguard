@@ -11,6 +11,7 @@ from .rules import (
     classify_postgres_sqlstate,
     classify_psycopg,
     classify_asyncpg,
+    classify_redis,
     classify_requests,
     classify_sqlalchemy,
 )
@@ -22,6 +23,7 @@ DEFAULT_RULES: tuple[ClassifierRule, ...] = (
     classify_http_status,
     classify_httpx,
     classify_requests,
+    classify_redis,
     classify_sqlalchemy,
     classify_builtin,
     classify_postgres_sqlstate,

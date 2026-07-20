@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- `classify_redis` rule: type-based classification of `redis.exceptions.*` (no message
+  parsing). Registered in `DEFAULT_RULES` before `classify_builtin`, since
+  `redis.exceptions.LockError` subclasses `ValueError` and would otherwise be
+  intercepted there. Handles the `AuthenticationError`/`AuthorizationError`
+  (`ConnectionError` subclasses) and `ClusterDownError`/`TryAgainError`
+  (`ResponseError` subclasses) edge cases explicitly so credential failures and
+  transient cluster-resharding states aren't misclassified.
+- New `redis` optional dependency group (`redis>=4.2.0,<6.0`).
+
 ---
 
 ## [1.0.0] — 2026-04-29
