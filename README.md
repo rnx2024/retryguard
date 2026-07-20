@@ -30,6 +30,8 @@ It classifies:
   and maps transient/non-transient codes to decisions.
 - **SQLAlchemy** (when installed): pool timeouts and `DBAPIError.connection_invalidated`, plus SQLSTATE
   extraction from the wrapped DBAPI exception chain.
+- **Redis / redis-py** (when installed): type-based dispatch over `redis.exceptions.*` — no message
+  parsing, since redis-py already parses the wire-protocol error into distinct exception classes.
 - **Builtins**: `TimeoutError` (retryable), `ConnectionError`/`OSError` (retryable), `ValueError`
   (non-retryable).
 
@@ -78,6 +80,42 @@ Non-retryable examples:
 - `23xxx` constraint violations (e.g. `23505` unique violation)
 - `28xxx` invalid authorization
 - `22xxx` data exceptions (invalid input, etc.)
+
+## Redis / redis-py
+
+`retryguard` classifies `redis.exceptions.*` by type — never by parsing the exception message.
+redis-py already converts the server's wire-protocol error prefix (`-LOADING`, `-READONLY`,
+`-NOSCRIPT`, `-MOVED`, etc.) into a distinct Python exception class before your code sees it, so
+`classify_redis` is a pure `isinstance` dispatch, the same shape as `classify_httpx`.
+
+Two subtleties drove the branch order in `classify_redis` (checked narrow-subclass-first,
+broad-parent-last):
+
+- `AuthenticationError`/`AuthorizationError` are `ConnectionError` subclasses in redis-py. They're
+  checked *before* the generic `ConnectionError` branch and marked non-retryable — otherwise bad
+  credentials would get retried, which is exactly what this library exists to prevent.
+- `ClusterDownError`/`TryAgainError` are `ResponseError` subclasses. They're checked *before* the
+  generic `ResponseError` catch-all so transient cluster-resharding states aren't misclassified as
+  permanent failures.
+
+Retryable examples:
+
+- `ConnectionError`, `TimeoutError`, `BusyLoadingError` (still loading), `MaxConnectionsError`
+  (pool exhausted)
+- `WatchError` — optimistic-lock conflict on a watched key; same concept as Postgres `40001`
+  (serialization_failure), which is also retryable
+- `ClusterDownError` (and its subclass `MasterDownError`), `TryAgainError` — transient cluster state
+- `ReadOnlyError` — replica hasn't finished promotion to primary during failover
+
+Non-retryable examples:
+
+- `AuthenticationError`, `AuthorizationError` — bad credentials/permissions
+- `MovedError`, `AskError` — cluster redirects; the fix is reconnecting to a different node, not
+  retrying the same connection
+- `NoScriptError` — retrying `EVALSHA` fails identically without reloading the script first
+  (`SCRIPT LOAD` / `EVAL`)
+- `LockError` / `LockNotOwnedError`, `DataError`, `InvalidResponse`, and any other `ResponseError`
+  (syntax/argument errors, e.g. `WRONGTYPE`)
 
 ## Usage
 
