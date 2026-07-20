@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.1] — 2026-07-20
+
+### Documentation
+- Added async/trio usage examples to the README: `classify()` called directly
+  inside `asyncio`/`trio` coroutines (no separate async variant needed, since it
+  performs no I/O), and confirmation that the tenacity integration's `@retry`
+  decorator works unchanged on `async def` functions. No code or behavior
+  changes.
+
+---
+
 ## [1.1.0] — 2026-07-20
 
 Four new provider integrations (Redis, AWS, GCP, Azure), a telemetry hook, and two
