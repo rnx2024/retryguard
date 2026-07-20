@@ -16,6 +16,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`ResponseError` subclasses) edge cases explicitly so credential failures and
   transient cluster-resharding states aren't misclassified.
 - New `redis` optional dependency group (`redis>=4.2.0,<6.0`).
+- `classify_aws` rule: `Error.Code`-based classification of `botocore.exceptions.ClientError`
+  (mirroring botocore's own internal retry policy from `botocore.retries.standard`, not an
+  invented list), plus type-based dispatch for connection-level `BotoCoreError`s. Deliberately
+  does not reuse `classify_http_status`, because AWS returns HTTP `400` for both throttling and
+  genuine permanent validation errors — status-code-only classification would misclassify
+  throttling as non-retryable. Registered in `DEFAULT_RULES` before `classify_builtin`, since
+  `botocore.exceptions.ConnectTimeoutError`/`ReadTimeoutError`/`ProxyConnectionError` subclass
+  builtin `OSError` and would otherwise be intercepted there.
+- New `aws` optional dependency group (`botocore>=1.34.0,<2.0`).
+- `classify_gcp` rule: type-based classification of `google.api_core.exceptions.*`.
+  Registered in `DEFAULT_RULES` *before* `classify_http_status` — google-api-core
+  exceptions expose a `.code` attribute that the generic HTTP-status extraction
+  already reads, so `classify_http_status` would otherwise intercept every GCP
+  exception first. Fixes two cases where GCP's own semantics diverge from generic
+  HTTP status-code conventions: `Aborted` (HTTP 409, but retryable — transaction
+  conflict, same precedent as Postgres `40001`/Redis `WatchError`) and
+  `DeadlineExceeded`/`GatewayTimeout`/`BadGateway` (HTTP 504/502, but not
+  retryable by google-api-core's own default retry policy). Every other case is
+  classified explicitly with its own `gcp_*` reason code rather than delegating to
+  the generic HTTP rule, to avoid GCP's correctness silently depending on
+  `classify_http_status`'s status-code tables never changing.
+- New `gcp` optional dependency group (`google-api-core>=2.0.0,<3.0`).
+- `classify_azure` rule: type/status-based classification of `azure.core.exceptions.*`.
+  Registered in `DEFAULT_RULES` *before* `classify_http_status` — `HttpResponseError`
+  exposes a `.status_code` attribute (the first name the generic HTTP-status
+  extraction checks), so `classify_http_status` would otherwise intercept every
+  Azure exception first. `ResourceModifiedError` (ETag conflict, typically HTTP
+  412) is treated as retryable — same precedent as Postgres `40001`, Redis
+  `WatchError`, AWS `ConditionalCheckFailedException`, and GCP `Aborted` — and is
+  disambiguated by type from `ResourceNotFoundError`, which can carry the same
+  412 status on update operations but stays non-retryable.
+- New `azure` optional dependency group (`azure-core>=1.28.0,<2.0`).
 
 ---
 

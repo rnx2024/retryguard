@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from retryguard import RetryCategory
+from retryguard import ErrorClassifier, RetryCategory
 
 
 def _classify_redis():
@@ -274,3 +274,53 @@ def test_redis_non_redis_exception_returns_none() -> None:
     classify_redis = _classify_redis()
 
     assert classify_redis(ValueError("not redis")) is None
+
+
+# ── end-to-end through the full DEFAULT_RULES pipeline ─────────────────────────
+# These specifically prove classify_redis is registered *before* classify_builtin
+# in DEFAULT_RULES; the unit tests above only prove classify_redis is correct in
+# isolation, not that ordering actually routes exceptions to it first.
+
+
+@pytest.mark.parametrize(
+    "exc_name,retryable,expected_reason_code",
+    [
+        ("ConnectionError", True, "redis_connection_error"),
+        ("TimeoutError", True, "redis_timeout"),
+        ("AuthenticationError", False, "redis_auth_error"),
+        ("WatchError", True, "redis_watch_conflict"),
+    ],
+)
+def test_redis_errors_classified_end_to_end(
+    exc_name: str, retryable: bool, expected_reason_code: str
+) -> None:
+    redis = pytest.importorskip("redis")
+    exc_cls = getattr(redis.exceptions, exc_name)
+    decision = ErrorClassifier().classify(exc_cls("boom"))
+
+    assert decision.retryable is retryable
+    assert decision.reason_code == expected_reason_code
+
+
+def test_redis_lock_error_not_swallowed_by_builtin_value_error_end_to_end() -> None:
+    """LockError subclasses (RedisError, ValueError). If DEFAULT_RULES ordering
+    regressed (classify_builtin running before classify_redis), this would come
+    back as reason_code='builtin_value_error' instead of the redis-specific one."""
+    redis = pytest.importorskip("redis")
+    decision = ErrorClassifier().classify(redis.exceptions.LockError("could not acquire lock"))
+
+    assert decision.retryable is False
+    assert decision.reason_code == "redis_lock_error"
+    assert decision.category == RetryCategory.VALIDATION
+
+
+def test_redis_cluster_down_error_not_swallowed_by_generic_response_error() -> None:
+    """ClusterDownError subclasses ResponseError; must hit its own branch before
+    the generic ResponseError -> non-retryable catch-all."""
+    redis = pytest.importorskip("redis")
+    decision = ErrorClassifier().classify(
+        redis.exceptions.ClusterDownError("CLUSTERDOWN The cluster is down")
+    )
+
+    assert decision.retryable is True
+    assert decision.reason_code == "redis_cluster_down"

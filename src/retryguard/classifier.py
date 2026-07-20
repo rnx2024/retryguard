@@ -5,7 +5,10 @@ from functools import lru_cache
 
 from .models import RetryCategory, RetryDecision
 from .rules import (
+    classify_aws,
+    classify_azure,
     classify_builtin,
+    classify_gcp,
     classify_http_status,
     classify_httpx,
     classify_postgres_sqlstate,
@@ -20,10 +23,17 @@ ClassifierRule = Callable[[BaseException], RetryDecision | None]
 
 
 DEFAULT_RULES: tuple[ClassifierRule, ...] = (
+    # classify_gcp/classify_azure must precede classify_http_status: their
+    # exceptions expose a `.code`/`.status_code` attribute that
+    # extract_status_code already reads, so classify_http_status would otherwise
+    # intercept every GCP/Azure exception first.
+    classify_gcp,
+    classify_azure,
     classify_http_status,
     classify_httpx,
     classify_requests,
     classify_redis,
+    classify_aws,
     classify_sqlalchemy,
     classify_builtin,
     classify_postgres_sqlstate,
