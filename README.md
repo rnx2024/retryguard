@@ -245,6 +245,47 @@ except Exception as exc:
         print("fail", decision.reason_code, decision.reason)
 ```
 
+## Async usage
+
+`classify()` performs no I/O, so there's no separate async variant to await — call it exactly the
+same way from inside a coroutine. Works the same for `asyncio` and `trio`:
+
+```python
+import asyncio
+from retryguard import ErrorClassifier
+
+classifier = ErrorClassifier()
+
+async def call_something_async():
+    try:
+        ...
+    except Exception as exc:
+        decision = classifier.classify(exc)  # sync call; safe and non-blocking inside async code
+        if not decision.retryable:
+            raise
+        delay = decision.retry_after_seconds or decision.suggested_delay_seconds or 2.0
+        await asyncio.sleep(delay)
+        # retry...
+```
+
+```python
+import trio
+from retryguard import ErrorClassifier
+
+classifier = ErrorClassifier()
+
+async def call_something_async():
+    try:
+        ...
+    except Exception as exc:
+        decision = classifier.classify(exc)
+        if not decision.retryable:
+            raise
+        delay = decision.retry_after_seconds or decision.suggested_delay_seconds or 2.0
+        await trio.sleep(delay)
+        # retry...
+```
+
 ## Celery example (don’t retry blindly)
 
 ```python
@@ -293,6 +334,21 @@ classifier = ErrorClassifier()
     before_sleep=before_sleep_log_retryguard(logger, classifier=classifier),
 )
 def call_something():
+    ...
+```
+
+The same decorator works unchanged on an `async def` function — tenacity's `AsyncRetrying` still
+calls `retry=`/`wait=`/`before_sleep=` synchronously between attempts regardless of whether the
+wrapped function is sync or async, so no separate async predicate is needed:
+
+```python
+@retry(
+    retry=retry_if_retryguard(classifier),
+    wait=wait_retryguard(classifier, fallback_seconds=1.0),
+    stop=stop_after_attempt(5),
+    before_sleep=before_sleep_log_retryguard(logger, classifier=classifier),
+)
+async def call_something_async():
     ...
 ```
 
