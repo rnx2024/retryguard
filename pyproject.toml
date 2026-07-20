@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retryguard"
-version = "1.0.0"
+version = "1.1.0"
 description = "Retryable and non-retryable error classifier for Python backends"
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from functools import lru_cache
 
@@ -19,7 +20,10 @@ from .rules import (
     classify_sqlalchemy,
 )
 
+_logger = logging.getLogger(__name__)
+
 ClassifierRule = Callable[[BaseException], RetryDecision | None]
+DecisionHook = Callable[[BaseException, RetryDecision], None]
 
 
 DEFAULT_RULES: tuple[ClassifierRule, ...] = (
@@ -45,14 +49,38 @@ DEFAULT_RULES: tuple[ClassifierRule, ...] = (
 class ErrorClassifier:
     DEFAULT_RULES: tuple[ClassifierRule, ...] = DEFAULT_RULES
 
-    def __init__(self, rules: tuple[ClassifierRule, ...] = DEFAULT_RULES) -> None:
+    def __init__(
+        self,
+        rules: tuple[ClassifierRule, ...] = DEFAULT_RULES,
+        *,
+        on_decision: DecisionHook | None = None,
+    ) -> None:
         self._rules = rules
+        self._on_decision = on_decision
 
     def classify(self, exc: BaseException) -> RetryDecision:
+        decision = self._classify(exc)
+        if self._on_decision is not None:
+            try:
+                self._on_decision(exc, decision)
+            except Exception:
+                _logger.exception(
+                    "retryguard on_decision hook raised; classification unaffected "
+                    "(reason_code=%s)",
+                    decision.reason_code,
+                )
+        return decision
+
+    def _classify(self, exc: BaseException) -> RetryDecision:
         for rule in self._rules:
             try:
                 decision = rule(exc)
             except Exception:
+                _logger.exception(
+                    "retryguard rule %s raised while classifying %s; skipping to next rule",
+                    getattr(rule, "__name__", repr(rule)),
+                    type(exc).__name__,
+                )
                 continue
             if decision is not None:
                 return decision
@@ -72,7 +100,9 @@ def default_classifier() -> ErrorClassifier:
     return ErrorClassifier()
 
 
-def classify_error(exc: BaseException, *, classifier: ErrorClassifier | None = None) -> RetryDecision:
+def classify_error(
+    exc: BaseException, *, classifier: ErrorClassifier | None = None
+) -> RetryDecision:
     return (classifier or default_classifier()).classify(exc)
 
 
